@@ -1,21 +1,43 @@
+use std::{collections::VecDeque, iter::zip};
+
 use bevy::{
     prelude::*, sprite::MaterialMesh2dBundle, time::common_conditions::on_timer, utils::Duration,
 };
 use rand::{seq::IteratorRandom, thread_rng};
 
-const EPSILON: f32 = 1e-10;
+const STEP: i16 = 10;
+const WALL_SIZE: i16 = 200;
 
 #[derive(Component, Debug)]
+struct Body;
+
+#[derive(Component, Debug)]
+struct Head;
+
+#[derive(Component, Debug)]
+struct Apple;
+
+#[derive(Debug, Default, Copy, Clone)]
 struct Direction {
     x: i16,
     y: i16,
 }
 
-#[derive(Component)]
-struct Snake;
+#[derive(Resource, Debug, Default)]
+struct Snake {
+    ids: Vec<Entity>,
+    dirs: VecDeque<Direction>,
+}
 
-#[derive(Component)]
-struct Apple;
+impl Snake {
+    fn add_entity(&mut self, entity: Entity, dir: Direction) {
+        self.ids.push(entity);
+        self.dirs.push_back(dir);
+    }
+}
+
+#[derive(Resource, Debug, Default)]
+struct SnakeLength(usize);
 
 fn main() {
     let mut app = App::new();
@@ -29,150 +51,198 @@ fn main() {
         ..Default::default()
     }));
 
+    app.insert_resource(Snake::default());
+
     app.add_startup_system(setup);
-    app.add_system(change_direction);
+
+    app.add_system(wall_collision);
+    app.add_system(change_direction.before(wall_collision));
     app.add_system(
         move_snake
             .run_if(on_timer(Duration::from_secs_f32(0.15)))
             .after(change_direction)
-            .before(apple_collision),
+            .after(wall_collision),
     );
-    app.add_system(apple_collision);
-    app.add_system(
-        wall_collision
-            .before(apple_collision)
-            .after(move_snake)
-            .after(change_direction),
-    );
-    app.add_system(bevy::window::close_on_esc);
+    app.add_system(eat_apple.after(move_snake));
 
     app.run();
+}
+
+fn get_square(
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    color: Color,
+) -> MaterialMesh2dBundle<ColorMaterial> {
+    MaterialMesh2dBundle {
+        mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
+        transform: Transform::default().with_scale(Vec3::splat(STEP as f32)),
+        material: materials.add(ColorMaterial::from(color)),
+        ..default()
+    }
 }
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut snake: ResMut<Snake>,
 ) {
     commands.spawn(Camera2dBundle::default());
 
+    let wall_size = WALL_SIZE as f32;
+
+    let black_square = get_square(&mut meshes, &mut materials, Color::BLACK);
+    let red_square = get_square(&mut meshes, &mut materials, Color::RED);
+
+    // spawn apple in center
     commands
+        .spawn((Apple {}, SpatialBundle::default()))
+        .with_children(|parent| {
+            parent.spawn(red_square);
+        });
+
+    // spawn snake in lower right corner
+    let head_id = commands
         .spawn((
-            Snake {},
-            Direction { x: 0, y: 0 },
-            TransformBundle {
-                local: Transform::from_xyz(-100., -100., 1.),
+            Body {},
+            Head {},
+            SpatialBundle {
+                transform: Transform::from_xyz(wall_size, -wall_size, 1.),
                 ..Default::default()
             },
-            VisibilityBundle::default(),
         ))
         .with_children(|parent| {
-            parent
-                .spawn(MaterialMesh2dBundle {
-                    mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
-                    transform: Transform::default().with_scale(Vec3::splat(10.)),
-                    material: materials.add(ColorMaterial::from(Color::BLACK)),
-                    ..default()
-                })
-                .with_children(|parent| {
-                    parent.spawn(MaterialMesh2dBundle {
-                        mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
-                        transform: Transform::from_xyz(-1., 0., 1.),
-                        material: materials.add(ColorMaterial::from(Color::BLACK)),
-                        ..default()
-                    });
-                });
-        });
-    commands
+            // spawn a square shape as snake head
+            parent.spawn(black_square.clone());
+        })
+        .id();
+
+    // spawn a square shape as snake body
+    let tail_id = commands
         .spawn((
-            Apple {},
-            TransformBundle {
-                local: Transform::from_xyz(0., 0., 0.),
+            Body {},
+            SpatialBundle {
+                transform: Transform::from_xyz(wall_size - STEP as f32, -wall_size, 1.),
                 ..Default::default()
             },
-            VisibilityBundle::default(),
         ))
         .with_children(|parent| {
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: meshes.add(Mesh::from(shape::Quad::default())).into(),
-                transform: Transform::default().with_scale(Vec3::splat(10.)),
-                material: materials.add(ColorMaterial::from(Color::RED)),
-                ..default()
-            });
-        });
+            parent.spawn(black_square.clone());
+        })
+        .id();
+
+    let dir = Direction { x: STEP, y: 0 };
+    snake.add_entity(head_id, dir);
+    snake.add_entity(tail_id, dir);
 }
 
-fn wall_collision(mut snake: Query<&mut Transform, (With<Snake>, Without<Apple>)>) {
-    let mut snake_pos = snake.single_mut();
-
-    if snake_pos.translation.x >= 110. {
-        snake_pos.translation.x = -100.;
-    }
-    if snake_pos.translation.x <= -110. {
-        snake_pos.translation.x = 100.;
-    }
-    if snake_pos.translation.y >= 110. {
-        snake_pos.translation.y = -100.;
-    }
-    if snake_pos.translation.y <= -110. {
-        snake_pos.translation.y = 100.;
-    }
-}
-
-fn apple_collision(
+fn eat_apple(
     mut commands: Commands,
-    mut apple: Query<&mut Transform, (With<Apple>, Without<Snake>)>,
-    mut snake: Query<&Transform, (With<Snake>, Without<Apple>)>,
+    head: Query<&Transform, With<Head>>,
+    body: Query<&Transform, With<Body>>,
+    mut apple: Query<&mut Transform, (With<Apple>, Without<Body>, Without<Head>)>,
+    mut snake: ResMut<Snake>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     let mut apple_pos = apple.single_mut();
-    let snake_pos = snake.single_mut();
+    let head_pos = head.single();
 
-    let diff = (apple_pos.translation - snake_pos.translation).abs();
-    if (diff.x <= EPSILON) && (diff.y <= EPSILON) {
+    let diff = (apple_pos.translation - head_pos.translation).abs();
+    if (diff.x <= f32::EPSILON) && (diff.y <= f32::EPSILON) {
+        let black_square = get_square(&mut meshes, &mut materials, Color::BLACK);
+
+        let tail_id = snake.ids.last().unwrap().clone();
+        let tail_dir = snake.dirs.back().unwrap().clone();
+
+        let tail_pos = body.get(tail_id).unwrap().translation;
+
+        let new_tail_id = commands
+            .spawn((
+                Body {},
+                SpatialBundle {
+                    transform: Transform::from_xyz(
+                        tail_pos.x - tail_dir.x as f32,
+                        tail_pos.y - tail_dir.y as f32,
+                        1.,
+                    ),
+                    ..Default::default()
+                },
+            ))
+            .with_children(|parent| {
+                parent.spawn(black_square.clone());
+            })
+            .id();
+
+        snake.add_entity(new_tail_id, tail_dir);
+
         let mut rng = thread_rng();
-        let dist = (-100..100).step_by(10);
+        let x_dist = (-WALL_SIZE..WALL_SIZE).step_by(STEP as usize).filter(|i| {
+            body.iter()
+                .map(|pos| pos.translation.x)
+                .any(|x| *i != x as i16)
+        });
+        let y_dist = (-WALL_SIZE..WALL_SIZE).step_by(STEP as usize).filter(|i| {
+            body.iter()
+                .map(|pos| pos.translation.y)
+                .any(|y| *i != y as i16)
+        });
 
-        let mut new_x = dist.clone().choose(&mut rng).unwrap() as f32;
-        let mut new_y = dist.clone().choose(&mut rng).unwrap() as f32;
-
-        while (new_x - snake_pos.translation.x).abs() < EPSILON {
-            new_x = dist.clone().choose(&mut rng).unwrap() as f32;
-        }
-        while (new_y - snake_pos.translation.y).abs() < EPSILON {
-            new_y = dist.clone().choose(&mut rng).unwrap() as f32;
-        }
-        apple_pos.translation.x = new_x;
-        apple_pos.translation.y = new_y;
+        apple_pos.translation.x = x_dist.choose(&mut rng).unwrap() as f32;
+        apple_pos.translation.y = y_dist.choose(&mut rng).unwrap() as f32;
     }
 }
 
-fn move_snake(mut snake: Query<(&mut Transform, &Direction), With<Snake>>) {
-    let (mut snake_pos, direction) = snake.single_mut();
-
-    snake_pos.translation.x += (direction.x * 10) as f32;
-    snake_pos.translation.y += (direction.y * 10) as f32;
-}
-
-fn change_direction(
-    keyboard_input: Res<Input<KeyCode>>,
-    mut query: Query<&mut Direction, With<Snake>>,
-) {
-    let mut direction = query.single_mut();
-
+fn change_direction(keyboard_input: Res<Input<KeyCode>>, mut parts: ResMut<Snake>) {
+    let direction = &mut parts.dirs[0];
     if keyboard_input.pressed(KeyCode::Left) && direction.x == 0 {
-        direction.x = -1;
+        direction.x = -STEP;
         direction.y = 0;
     }
     if keyboard_input.pressed(KeyCode::Right) && direction.x == 0 {
-        direction.x = 1;
+        direction.x = STEP;
         direction.y = 0;
     }
     if keyboard_input.pressed(KeyCode::Up) && direction.y == 0 {
         direction.x = 0;
-        direction.y = 1;
+        direction.y = STEP;
     }
     if keyboard_input.pressed(KeyCode::Down) && direction.y == 0 {
         direction.x = 0;
-        direction.y = -1;
+        direction.y = -STEP;
+    }
+}
+
+fn move_snake(
+    mut query: Query<&mut Transform, (With<Body>, Without<Apple>)>,
+    mut parts: ResMut<Snake>,
+) {
+    for (entity, dir) in zip(&parts.ids, &parts.dirs) {
+        let mut pos = query.get_mut(*entity).unwrap();
+        pos.translation.x += dir.x as f32;
+        pos.translation.y += dir.y as f32;
+    }
+
+    parts.dirs.pop_back();
+    let front = *parts.dirs.front().unwrap();
+    parts.dirs.push_front(front);
+}
+
+fn wall_collision(mut snake: Query<&mut Transform, With<Body>>) {
+    let wall_size = WALL_SIZE as f32;
+    let limit = wall_size + STEP as f32;
+    for mut pos in snake.iter_mut() {
+        if pos.translation.x >= limit {
+            pos.translation.x = -wall_size;
+        }
+        if pos.translation.x <= -limit {
+            pos.translation.x = wall_size;
+        }
+        if pos.translation.y >= limit {
+            pos.translation.y = -wall_size;
+        }
+        if pos.translation.y <= -limit {
+            pos.translation.y = wall_size;
+        }
     }
 }
